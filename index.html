@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Derpy</title>
+
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <script type="module">
+    import nacl from "https://cdn.jsdelivr.net/npm/tweetnacl/+esm";
+    import util from "https://cdn.jsdelivr.net/npm/tweetnacl-util/+esm";
+    import {
+      Application,
+      Controller,
+    } from "https://cdn.jsdelivr.net/npm/@hotwired/stimulus/+esm";
+
+    nacl.util = util;
+
+    class Connection {
+      static FrameType = {
+        ServerKey: 0x01, // 8B magic + 32B public key + (0+ bytes future use)
+        ClientInfo: 0x02, // 32B pub key + 24B nonce + naclbox(json)
+        ServerInfo: 0x03, // 24B nonce + naclbox(json)
+        SendPacket: 0x04, // 32B dest pub key + packet bytes
+        RecvPacket: 0x05, // 32B src pub key + packet bytes
+        PeerGone: 0x08, // 32B pub key of peer that's gone + 1 byte reason
+      };
+
+      static ClientInfo = {
+        Version: 2,
+        CanAckPings: false,
+        IsProber: false,
+      };
+
+      constructor({ publicKey, privateKey, peerPublicKey }) {
+        this.publicKey = publicKey;
+        this.privateKey = privateKey;
+        this.peerPublicKey = peerPublicKey;
+        this.serverPublicKey = null;
+        this.socket = new WebSocket("wss://derp8e.tailscale.com/derp", ["derp"]);
+        this.onpacket = null;
+
+        this.socket.addEventListener("open", (event) => {
+          console.log(`Socket open`);
+        });
+
+        this.socket.addEventListener("close", (event) => {
+          console.log(`Socket closed`);
+        });
+
+        this.socket.addEventListener("message", async (event) => {
+          const frame = new Uint8Array(await event.data.arrayBuffer());
+          this.handleFrame(frame);
+        });
+      }
+
+      handleFrame(frame) {
+        const typeInt = new DataView(frame.slice(0, 1).buffer).getInt8();
+        const type = Object.keys(Connection.FrameType)[typeInt - 1];
+
+        console.debug(`socket> ${type || typeInt}`);
+
+        switch (type) {
+          case "ServerKey":
+            this.recvServerKey(frame);
+            break;
+
+          case "ServerInfo":
+            this.recvServerInfo(frame);
+            break;
+
+          case "RecvPacket":
+            this.recvPacket(frame);
+            break;
+        }
+      }
+
+      recvServerKey(frame) {
+        const length = new DataView(frame.slice(0, 4).buffer).getInt32();
+        const magic = nacl.util.encodeUTF8(frame.slice(5, 13));
+        this.serverPublicKey = frame.slice(13, 13 + length);
+        const nonce = nacl.randomBytes(nacl.box.nonceLength);
+        const box = nacl.box(
+          util.decodeUTF8(JSON.stringify(Connection.ClientInfo)),
+          nonce,
+          this.serverPublicKey,
+          this.privateKey,
+        );
+        const responseType = new Uint8Array([
+          Connection.FrameType["ClientInfo"],
+        ]);
+        const msgLength = new Uint8Array(4);
+        const view = new DataView(msgLength.buffer);
+        view.setUint32(0, this.publicKey.length + nonce.length + box.length);
+
+        this.socket.send(
+          new Uint8Array([
+            ...responseType,
+            ...msgLength,
+            ...this.publicKey,
+            ...nonce,
+            ...box,
+          ]),
+        );
+      }
+
+      recvServerInfo(frame) {
+        const length = new DataView(frame.slice(1, 5).buffer).getInt32();
+        const nonce = frame.slice(5, 29);
+        const box = frame.slice(29, 29 + length - 24);
+        const json = util.encodeUTF8(
+          nacl.box.open(box, nonce, this.serverPublicKey, this.privateKey),
+        );
+        const serverInfo = JSON.parse(json);
+
+        console.log("Server info", serverInfo);
+      }
+
+      sendPacket({ peerPublicKey, packet }) {
+        const responseType = new Uint8Array([
+          Connection.FrameType["SendPacket"],
+        ]);
+        const msgLength = new Uint8Array(4);
+        const view = new DataView(msgLength.buffer);
+        view.setUint32(0, peerPublicKey.length + packet.length);
+
+        const frame = new Uint8Array([
+          ...responseType,
+          ...msgLength,
+          ...peerPublicKey,
+          ...packet,
+        ]);
+
+        console.debug(`socket< SendPacket`);
+
+        this.socket.send(frame);
+      }
+
+      recvPacket(frame) {
+        const length = new DataView(frame.slice(1, 5).buffer).getInt32();
+        const peerPublicKey = frame.slice(5, 37);
+        const packet = frame.slice(37);
+
+        this.onpacket.call(null, packet);
+      }
+    }
+
+    class ChatController extends Controller {
+      static targets = ["messages", "publicKey", "message"];
+
+      static values = {
+        state: String,
+      };
+
+      connect() {
+        const { publicKey, secretKey } = nacl.box.keyPair();
+        this.privateKey = secretKey;
+        this.publicKey = publicKey;
+        this.publicKeyTarget.innerText = nacl.util.encodeBase64(publicKey);
+      }
+
+      setPeerPublicKey(event) {
+        this.peerPublicKey = nacl.util.decodeBase64(event.target.value);
+        this.stateValue = "ready";
+
+        this.connection = new Connection({
+          publicKey: this.publicKey,
+          privateKey: this.privateKey,
+          peerPublicKey: this.peerPublicKey,
+        });
+
+        this.connection.onpacket = this.receive.bind(this);
+      }
+
+      deliver() {
+        if (this.messageTarget.value != "") {
+          const message = this.messageTarget.value;
+          this.messageTarget.value = "";
+          const nonce = nacl.randomBytes(nacl.box.nonceLength);
+          const box = nacl.box(
+            nacl.util.decodeUTF8(message),
+            nonce,
+            this.peerPublicKey,
+            this.privateKey,
+          );
+
+          const packet = new Uint8Array([...nonce, ...box]);
+
+          this.connection.sendPacket({
+            peerPublicKey: this.peerPublicKey,
+            packet,
+          });
+
+          this.messagesTarget.insertAdjacentHTML(
+            "beforeend",
+            `
+          <div class="rounded-xl bg-neutral-200 py-1 px-3 self-end">
+            ${message}
+          </div>
+          `,
+          );
+        }
+      }
+
+      receive(packet) {
+        const nonce = packet.slice(0, nacl.box.nonceLength);
+        const box = packet.slice(nacl.box.nonceLength, packet.length);
+        const message = util.encodeUTF8(
+          nacl.box.open(box, nonce, this.peerPublicKey, this.privateKey),
+        );
+
+        this.messagesTarget.insertAdjacentHTML(
+          "beforeend",
+          `
+        <div class="rounded-xl bg-blue-500 text-white py-1 px-3 self-start">
+          ${message}
+        </div>
+        `,
+        );
+      }
+    }
+
+    window.Stimulus = Application.start();
+    Stimulus.register("chat", ChatController);
+  </script>
+  <body>
+    <main
+      data-controller="chat"
+      data-chat-state-value="loading"
+      class="group flex items-center justify-center h-screen"
+    >
+      <div
+        class="group-data-[chat-state-value=ready]:hidden text-center space-y-16"
+      >
+        <div class="font-bold text-6xl">👋 Hello</div>
+        <div class="space-y-4">
+          <div>
+            <span
+              data-chat-target="publicKey"
+              class="font-mono text-xl select-all bg-yellow-100"
+            ></span>
+          </div>
+          <div>
+            Give this key to someone 👆
+            <br />
+            Paste there's here 👇
+          </div>
+          <div>
+            <input
+              type="text"
+              data-action="chat#setPeerPublicKey"
+              class="text-xl border-b-2 border-neutral-800 w-[500px] text-center focus-visible:outline focus-visible:outline-transparent focus-visible:border-blue-600"
+              autofocus
+            />
+          </div>
+        </div>
+      </div>
+      <div
+        class="hidden group-data-[chat-state-value=ready]:flex flex-col w-full h-full"
+      >
+        <div data-chat-target="messages" class="grow p-4 flex flex-col"></div>
+
+        <div class="flex w-full px-4 py-2 gap-4">
+          <div class="flex-1">
+            <textarea
+              data-chat-target="message"
+              class="w-full border border-neutral-400 rounded-xl resize-none py-1 px-2 shadow-inner focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+            ></textarea>
+          </div>
+          <div>
+            <button
+              data-action="chat#deliver"
+              class="rounded-full bg-blue-600 p-2 text-white shadow-sm hover:bg-blue-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke-width="1.5"
+                stroke="currentColor"
+                class="w-6 h-6"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
